@@ -5,9 +5,9 @@ use std::{
     mem::drop,
     pin::Pin,
     ptr::NonNull,
-    task::{Waker, RawWaker, RawWakerVTable, Poll, Context},
     sync::atomic::{fence, AtomicBool, AtomicU8, AtomicUsize, Ordering},
     sync::Mutex,
+    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
     thread,
 };
 
@@ -137,7 +137,11 @@ pub struct Parker {
 }
 
 impl Parker {
-    pub unsafe fn block_on<F: Future>(mut fut: Pin<&mut F>) -> F::Output {
+    pub unsafe fn block_on<F: Future>(mut fut: F) -> F::Output {
+        Self::block_on_pinned(Pin::new_unchecked(&mut fut))
+    }
+
+    unsafe fn block_on_pinned<F: Future>(mut fut: Pin<&mut F>) -> F::Output {
         struct Signal {
             thread: thread::Thread,
             notified: AtomicBool,
@@ -216,7 +220,7 @@ impl Parker {
                         }
 
                         self.waiter = Some(waiter);
-                        Parker::block_on(Pin::new(self));
+                        Parker::block_on_pinned(Pin::new(self));
                     }
                 }
             }
