@@ -1,317 +1,220 @@
-use crate::{
-    atomic::{Backoff, CachePadded},
-    error::{RecvError, SendError, TryRecvError, TrySendError},
-    parker::Parker,
-};
+use sptr::{write, Strict, NonNull};
 use std::{
+    time::Duration,
+    pin::Pin,
+    marker::PhantomPinned,
     alloc::{alloc, dealloc, Layout},
+    mem::{drop, size_of, align_of, MaybeUninit},
     cell::{Cell, UnsafeCell},
-    fmt,
-    marker::PhantomData,
-    mem::{align_of, drop, size_of, MaybeUninit},
-    slice,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    sync::Arc,
+    num::{NonZeroUsize, NonZeroU32},
+    sync::atomic::{AtomicU32, AtomicPtr, Ordering},
 };
 
+type Stamp = AtomicU32;
+type Value<T> = UnsafeCell<MaybeUninit<T>>;
+
 struct Array<T> {
-    ptr: *const u8,
-    capacity: usize,
-    _p: PhantomData<(T, AtomicBool)>,
+    ptr: NonNull<Value<T>>,
+    cap: NonZeroUsize,
 }
 
 impl<T> Array<T> {
-    fn alloc(capacity: usize) -> Self {
-        unsafe {
-            let ptr = alloc(Self::layout(capacity));
-            assert!(!ptr.is_null());
+    fn stamp_offset(capacity: NonZeroUsize) -> usize {
+        let align = align_of::<Stamp>().saturating_sub(align_of::<Value<T>>());
+        (size_of::<Value<T>>() * capacity.get()) + align;
+    }
 
-            let stored = ptr
-                .add(Self::stored_offset(capacity))
-                .cast::<MaybeUninit<AtomicBool>>();
-            for i in 0..capacity {
-                stored
-                    .add(i)
-                    .write(MaybeUninit::new(AtomicBool::new(false)));
-            }
+    fn layout(capacity: NonZeroUsize) -> Layout {
+        let align = align_of::<Value<T>>().max(align_of::<Stamp>());
+        let size = stamp_offset(capacity) + (size_of::<Stamp>() * capacity.get());
+        Layout::from_size_align(size, align).expect("capacity overflow")
+    }
+    
+    fn alloc(capacity: NonZeroUsize) -> Self {
+        let capacity = NonZeroUsize::new(capacity.get() as usize).unwrap();
+        let ptr = unsafe { alloc(Self::layout(capacity)) };
+        assert!(!ptr.is_null(), "out of memory");
 
-            Self {
-                ptr: ptr as *const u8,
-                capacity,
-                _p: PhantomData,
-            }
+        let values = ptr.cast::<Value<T>>();
+        let stamps = ptr.add(Self::stamp_offset(capacity)).cast::<Stamp>();
+        
+        for i in 0..capacity.get() {
+            write(values.add(i), Value::new(MaybeUninit::uninit()));
+            write(stamps.add(i), Stamp::new(i as u32));
+        }
+
+        Self {
+            ptr: values,
+            cap: capacity,
         }
     }
 
-    fn stored_offset(capacity: usize) -> usize {
-        let align = align_of::<AtomicBool>();
-        let offset = capacity * size_of::<T>();
-        (offset + align - 1) / (align * align)
-    }
-
-    fn layout(capacity: usize) -> Layout {
-        Layout::from_size_align(
-            Self::stored_offset(capacity) + (capacity * size_of::<AtomicBool>()),
-            align_of::<T>(),
-        )
-        .unwrap()
-    }
-
-    fn values(&self) -> &[UnsafeCell<MaybeUninit<T>>] {
-        self.slice(0)
-    }
-
-    fn stored(&self) -> &[AtomicBool] {
-        self.slice(Self::stored_offset(self.capacity))
-    }
-
-    fn slice<S>(&self, offset: usize) -> &[S] {
-        unsafe {
-            let ptr = self.ptr.add(offset).cast();
-            slice::from_raw_parts(ptr, self.capacity)
+    unsafe fn from(ptr: *mut Value<T>, capacity: NonZeroU32) -> Self {
+        Self {
+            ptr: NonNull::new(ptr).unwrap(),
+            cap: NonZeroUsize::new(capacity.get() as usize).unwrap(),
         }
+    }
+
+    fn slot(&self, index: u32) -> (&Stamp, &Value<T>) {
+        let index = index as usize;
+        assert!(index < self.capacity.get());
+
+        let base = self.ptr.as_ptr().cast::<u8>();
+        let value = base.cast::<Value<T>>().add(index);
+        let stamp = base
+            .add(Self::stamp_offset(self.capacity))
+            .cast::<Stamp>()
+            .add(index);
+
+        (&*stamp, &*value)
+    }
+
+    unsafe fn dealloc(self) {
+        let ptr = self.ptr.as_ptr().cast::<u8>();
+        let layout = Self::layout(self.capacity);
+        dealloc(ptr, layout)
     }
 }
 
-impl<T> Drop for Array<T> {
-    fn drop(&mut self) {
-        let ptr = self.ptr as *mut u8;
-        let layout = Self::layout(self.capacity);
-        unsafe { dealloc(ptr, layout) }
-    }
+enum Entry<T> {
+    Empty,
+    Full(T),
+    Disconnected(T),
+}
+
+struct Waiter<T> {
+    prev: Cell<Option<NonNull<Self>>>,
+    next: Cell<Option<NonNull<Self>>>,
+    entry: Cell<Entry<T>>,
+    event: Event,
+    _pinned: PhantomPinned,
 }
 
 struct Producer {
-    tail: AtomicUsize,
-    sema: AtomicUsize,
+    tail: AtomicU32,
+    pending: AtomicPtr<Waiter<T>>,
 }
 
 struct Consumer<T> {
-    head: Cell<usize>,
-    array: Array<T>,
+    head: Cell<u32>,
+    event: Event,
+    disconnected: AtomicBool,
+    waiters: Cell<Option<NonNull<Waiter<T>>>>,
 }
 
-struct Queue<T> {
+struct Shared<T> {
+    array: AtomicPtr<T>,
+    capacity: NonZeroU32,
+}
+
+pub struct Channel<T> {
     producer: CachePadded<Producer>,
     consumer: CachePadded<Consumer<T>>,
+    shared: CachePadded<Shared<T>>,
 }
 
-impl<T> Queue<T> {
-    fn new(capacity: usize) -> Self {
-        let capacity = capacity.next_power_of_two();
-        Self {
-            producer: CachePadded(Producer {
-                tail: AtomicUsize::new(0),
-                sema: AtomicUsize::new(capacity),
-            }),
-            consumer: CachePadded(Consumer {
-                head: Cell::new(0),
-                array: Array::alloc(capacity),
-            }),
-        }
+impl<T> Channel<T> {
+    pub fn new(capacity: NonZeroUsize) -> Self {
+
     }
 
-    fn can_push(&self) -> bool {
-        self.producer.sema.load(Ordering::Relaxed) > 0
+    pub fn try_send(&self, value: T) -> Result<(), Result<T, T>> {
+
     }
 
-    fn try_push(&self, value: T) -> Result<(), T> {
-        let mut backoff = Backoff::default();
-        loop {
-            let sema = self.producer.sema.load(Ordering::Relaxed);
-            let new_sema = match sema.checked_sub(1) {
-                Some(new_sema) => new_sema,
-                None => return Err(value),
-            };
-
-            if let Err(_) = self.producer.sema.compare_exchange_weak(
-                sema,
-                new_sema,
-                Ordering::Acquire,
-                Ordering::Relaxed,
-            ) {
-                backoff.yield_now();
-                continue;
-            }
-
-            return Ok(unsafe {
-                let tail = self.producer.tail.fetch_add(1, Ordering::Relaxed);
-                let slot = tail & (self.consumer.array.capacity - 1);
-
-                let array = &self.consumer.array;
-                array
-                    .values()
-                    .get_unchecked(slot)
-                    .get()
-                    .write(MaybeUninit::new(value));
-                array
-                    .stored()
-                    .get_unchecked(slot)
-                    .store(true, Ordering::Release);
-            });
-        }
-    }
-
-    unsafe fn can_pop(&self) -> bool {
-        let head = self.consumer.head.get();
-        let slot = head & (self.consumer.array.capacity - 1);
-
-        let stored = self.consumer.array.stored().get_unchecked(slot);
-        stored.load(Ordering::Relaxed)
-    }
-
-    unsafe fn try_pop(&self) -> Option<T> {
-        let head = self.consumer.head.get();
-        let slot = head & (self.consumer.array.capacity - 1);
-
-        let stored = self.consumer.array.stored().get_unchecked(slot);
-        if !stored.load(Ordering::Acquire) {
-            return None;
-        }
-
-        let value = self.consumer.array.values().get_unchecked(slot);
-        let value = value.get().read().assume_init();
-        stored.store(false, Ordering::Release);
-
-        self.producer.sema.fetch_add(1, Ordering::Release);
-        self.consumer.head.set(head.wrapping_add(1));
-        Some(value)
-    }
-}
-
-impl<T> Drop for Queue<T> {
-    fn drop(&mut self) {
-        unsafe {
-            while let Some(value) = self.try_pop() {
-                drop(value);
-            }
-        }
-    }
-}
-
-struct Channel<T> {
-    queue: Queue<T>,
-    senders: Parker,
-    receiver: Parker,
-    disconnected: AtomicBool,
-}
-
-impl<T> fmt::Debug for Channel<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Channel").finish()
-    }
-}
-
-pub fn new<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
-    let channel = Arc::new(Channel {
-        queue: Queue::new(capacity),
-        senders: Parker::default(),
-        receiver: Parker::default(),
-        disconnected: AtomicBool::new(false),
-    });
-
-    let sender = Sender(channel.clone());
-    let receiver = Receiver {
-        channel,
-        _marker: PhantomData,
-    };
-
-    (sender, receiver)
-}
-
-#[derive(Debug)]
-pub struct Sender<T>(Arc<Channel<T>>);
-
-impl<T> Sender<T> {
-    pub fn try_send(&self, value: T) -> Result<(), TrySendError<T>> {
-        if self.0.disconnected.load(Ordering::Relaxed) {
-            return Err(TrySendError::Disconnected(value));
-        }
-
-        if let Err(value) = self.0.queue.try_push(value) {
-            return Err(TrySendError::Full(value));
-        }
-
-        self.0.receiver.unpark(1);
-        Ok(())
-    }
-
-    pub async fn send(&self, mut value: T) -> Result<(), SendError<T>> {
+    pub fn send(&self, mut value: T) -> Result<(), T> {
         loop {
             value = match self.try_send(value) {
                 Ok(()) => return Ok(()),
-                Err(TrySendError::Full(value)) => value,
-                Err(TrySendError::Disconnected(value)) => return Err(SendError(value)),
+                Err(Ok(v)) => v,
+                Err(Err(v)) => return Err(v),
             };
 
-            let should_park = || {
-                let disconnected = self.0.disconnected.load(Ordering::Relaxed);
-                disconnected || self.0.queue.can_push()
-            };
-
-            self.0.senders.park(should_park).await;
-        }
-    }
-
-    pub fn blocking_send(&self, value: T) -> Result<(), SendError<T>> {
-        unsafe { Parker::block_on(self.send(value)) }
-    }
-}
-
-impl<T> Drop for Sender<T> {
-    fn drop(&mut self) {
-        if Arc::strong_count(&self.0) == 2 {
-            self.0.disconnected.store(true, Ordering::Relaxed);
-            self.0.receiver.unpark(1);
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct Receiver<T> {
-    channel: Arc<Channel<T>>,
-    _marker: PhantomData<*mut ()>,
-}
-
-impl<T> Receiver<T> {
-    pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
-        if let Some(value) = unsafe { self.channel.queue.try_pop() } {
-            self.channel.senders.unpark(1);
-            return Ok(value);
-        }
-
-        if self.channel.disconnected.load(Ordering::Relaxed) {
-            return Err(TryRecvError::Disconnected);
-        }
-
-        Err(TryRecvError::Empty)
-    }
-
-    pub async fn recv(&mut self) -> Result<T, RecvError> {
-        loop {
-            match self.try_recv() {
-                Ok(value) => return Ok(value),
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => return Err(RecvError),
+            let pending = NonNull::new(self.producer.pending.load(Ordering::Acquire));
+            if pending == NonNull::dangling() {
+                return Err(value);
             }
 
-            let should_park = || {
-                let disconnected = self.channel.disconnected.load(Ordering::Relaxed);
-                disconnected || unsafe { self.channel.queue.can_pop() }
+            let waiter = Waiter {
+                next: Cell::new(pending),
+                entry: Cell::new(Entry::Full(value)),
+                event: Event::new(),
+                _pinned: PhantomPinned,
             };
 
-            self.channel.receiver.park(should_park).await;
+            let pinned_waiter = unsafe { Pin::new_unchecked(&waiter) };
+            if let Err(_) = self.producer.pending.compare_exchange(
+                pending.as_ptr(),
+                NonNull::from(&*pinned_waiter).as_ptr(),
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                value = match waiter.entry.replace(Entry::Empty) {
+                    Entry::Full(v) => v,
+                    _ => unreachable!(),
+                };
+
+                Backoff::spin_loop_hint();
+                continue;
+            }
+            
+            self.consumer.event.set();
+            assert!(waiter.event.wait(None));
+
+            return match waiter.entry.replace(Entry::Empty) {
+                Entry::Empty => Ok(()),
+                Entry::Full(_) => unreachable!(),
+                Entry::Disconnected(v) => Err(v),
+            };
         }
     }
 
-    pub fn blocking_recv(&mut self) -> Result<T, RecvError> {
-        unsafe { Parker::block_on(self.recv()) }
-    }
-}
+    pub unsafe fn try_recv(&self) -> Result<Option<T>, ()> {
+        let mut waiters = self.consumer.waiters.get();
+        if waiters.is_none() {
+            waiters = NonNull::new(self.producer.pending.load(Ordering::Relaxed));
+            assert_ne!(waiters, Some(NonNull::dangling()));
 
-impl<T> Drop for Receiver<T> {
-    fn drop(&mut self) {
-        self.channel.disconnected.store(true, Ordering::Relaxed);
-        self.channel.senders.unpark(usize::MAX);
+            if waiters.is_some() {
+                waiters = NonNull::new(self.producer.pending.swap(null_mut(), Ordering::Acquire));
+                assert_ne!(waiters, Some(NonNull::dangling()));
+            }
+        }
+
+        if let Some(waiter) = waiters {
+            self.consumer.waiters.set(waiter.as_ref().next.get());
+
+        }
+    }
+
+    pub unsafe fn recv(&self) -> Result<T, ()> {
+        self.recv_with(None).map(|value| value.unwrap())
+    }
+
+    pub unsafe fn recv_timeout(&self, timeout: Duration) -> Result<Option<T>, ()> {
+        self.recv_with(Some(timeout))
+    }
+
+    unsafe fn recv_with(&self, timeout: Option<Duration>) -> Result<Option<T>, ()> {
+        let mut timed_out = false;
+        loop {
+            match self.try_recv() {
+                Ok(None) => {},
+                Ok(Some(value)) => return Ok(Some(value)),
+                Err(()) => return Err(()),
+            }
+
+            if timed_out {
+                return Ok(None);
+            }
+
+            timed_out = self.consumer.event.wait(timeout);
+            self.consumer.event.reset();
+        }
+    }
+
+    fn disconnect(&self, is_sender: bool) {
+
     }
 }
