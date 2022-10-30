@@ -3,19 +3,20 @@
 #![warn(
     rust_2018_idioms,
     unreachable_pub,
-    missing_docs,
-    missing_debug_implementations
+    // missing_docs,
+    // missing_debug_implementations
 )]
 
 extern crate alloc;
 
+mod backoff;
 mod event;
 mod parker;
 mod queue;
 
-use queue::Queue;
 use alloc::sync::Arc;
 use core::{fmt, marker::PhantomData};
+use queue::Queue;
 
 pub use event::{Event, TimedEvent};
 

@@ -1,11 +1,11 @@
 use super::event::{Event, TimedEvent};
-use sptr::invalid_mut;
 use core::{
-    pin::Pin,
     marker::PhantomPinned,
+    pin::Pin,
     ptr::{null_mut, read, NonNull},
     sync::atomic::{AtomicPtr, Ordering},
 };
+use sptr::invalid_mut;
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub(super) enum ParkResult {
@@ -63,7 +63,7 @@ impl Parker {
 
         if state.is_null() {
             E::with(|event| {
-                let event_ref = EventRef{
+                let event_ref = EventRef {
                     _pinned: PhantomPinned,
                     ptr: NonNull::from(&*event).cast(),
                     set_fn: |ptr| unsafe {
@@ -142,12 +142,18 @@ impl Parker {
                 Ordering::Relaxed,
             ) {
                 Err(e) => state = e,
-                Ok(_) => return unsafe {
-                    let event_ref = read(state);
-                    (event_ref.set_fn)(event_ref.ptr)
-                },
+                Ok(_) => {
+                    return unsafe {
+                        let event_ref = read(state);
+                        (event_ref.set_fn)(event_ref.ptr)
+                    }
+                }
             }
         }
+    }
+
+    pub(super) fn is_shutdown(&self) -> bool {
+        self.state.load(Ordering::Acquire) == Self::SHUTDOWN
     }
 
     pub(super) fn shutdown(&self) {
