@@ -1,7 +1,7 @@
 use crate::{
     backoff::Backoff,
     event::{Event, TimedEvent},
-    parker::{ParkResult, Parker, TryParkResult},
+    parker::Parker,
 };
 use alloc::boxed::Box;
 use cache_padded::CachePadded;
@@ -72,6 +72,7 @@ impl<T> Block<T> {
 struct Consumer<T> {
     head: AtomicPtr<Block<T>>,
     parker: Parker,
+    disconnected: AtomicBool,
 }
 
 pub(super) struct Queue<T> {
@@ -85,6 +86,7 @@ impl<T> Queue<T> {
         consumer: CachePadded::new(Consumer {
             head: AtomicPtr::new(null_mut()),
             parker: Parker::EMPTY,
+            disconnected: AtomicBool::new(false),
         }),
     };
 
@@ -188,23 +190,88 @@ impl<T> Queue<T> {
     }
 
     pub(super) unsafe fn try_recv(&self) -> Result<Option<T>, ()> {
-        unimplemented!("todo")
+        let head = self.consumer.head.load(Ordering::Acquire);
+        let (mut block, mut index, _) = Block::<T>::decode(head);
+
+        if !block.is_null() {
+            if index == BLOCK_SIZE {
+                let next_block = (*block).next.load(Ordering::Acquire);
+                if !next_block.is_null() {
+                    Block::drop(block, 1);
+
+                    block = next_block;
+                    index = 0;
+
+                    let new_head = Block::encode(block, index, false);
+                    self.consumer.head.store(new_head, Ordering::Relaxed);
+                }
+            }
+
+            if index < BLOCK_SIZE {
+                if (*block).stored[index].load(Ordering::Acquire) {
+                    let new_head = Block::encode(block, index + 1, false);
+                    self.consumer.head.store(new_head, Ordering::Relaxed);
+
+                    let value = (*block).values[index].get().read().assume_init();
+                    return Ok(Some(value));
+                }
+            }
+        }
+
+        if self.consumer.disconnected.load(Ordering::Acquire) {
+            Err(())
+        } else {
+            Ok(None)
+        }
     }
 
     pub(super) unsafe fn recv<E: Event>(&self) -> Result<T, ()> {
-        unimplemented!("todo")
+        self.recv_with(|| {
+            self.consumer.parker.park::<E>();
+            false
+        })
+        .map(|value| value.unwrap())
     }
 
     pub(super) unsafe fn recv_timeout<E: TimedEvent>(
         &self,
         timeout: E::Duration,
     ) -> Result<Option<T>, ()> {
-        unimplemented!("todo")
+        let mut timeout = Some(timeout);
+        self.recv_with(|| {
+            let duration = timeout.take().unwrap();
+
+            match self.consumer.parker.try_park_for::<E>(duration) {
+                Err(()) | Ok(None) => true,
+                Ok(Some(unused_duration)) => {
+                    timeout = Some(unused_duration);
+                    false
+                }
+            }
+        })
+    }
+
+    unsafe fn recv_with(&self, mut do_park: impl FnMut() -> bool) -> Result<Option<T>, ()> {
+        let mut spins: u32 = 16;
+        let mut timed_out = false;
+        loop {
+            match self.try_recv() {
+                Ok(None) if !timed_out => {}
+                result => return result,
+            }
+
+            spins = spins.saturating_sub(1);
+            match spins {
+                0 => timed_out = do_park(),
+                _ => Backoff::spin_loop_hint(),
+            }
+        }
     }
 
     pub(super) fn disconnect(&self, is_sender: bool) {
         if is_sender {
-            self.consumer.parker.shutdown();
+            self.consumer.disconnected.store(true, Ordering::Release);
+            self.consumer.parker.unpark();
             return;
         }
 

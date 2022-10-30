@@ -5,20 +5,6 @@ use core::{
     ptr::{null_mut, read, NonNull},
     sync::atomic::{AtomicPtr, Ordering},
 };
-use sptr::invalid_mut;
-
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub(super) enum ParkResult {
-    Unparked,
-    Shutdown,
-}
-
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-pub(super) enum TryParkResult {
-    Unparked,
-    Timeout,
-    Shutdown,
-}
 
 struct EventRef {
     _pinned: PhantomPinned,
@@ -35,29 +21,34 @@ impl Parker {
         state: AtomicPtr::new(null_mut()),
     };
 
-    pub(super) fn park<E: Event>(&self) -> ParkResult {
-        match self.park_with::<E>(|event| {
+    pub(super) fn park<E: Event>(&self) {
+        assert!(self.park_with::<E>(|event| {
             event.wait();
             true
-        }) {
-            Ok(true) => ParkResult::Unparked,
-            Ok(false) => unreachable!(),
-            Err(()) => ParkResult::Shutdown,
-        }
+        }))
     }
 
-    pub(super) fn try_park_for<E: TimedEvent>(&self, timeout: E::Duration) -> TryParkResult {
-        match self.park_with::<E>(|event| event.try_wait_for(timeout)) {
-            Ok(true) => TryParkResult::Unparked,
-            Ok(false) => TryParkResult::Timeout,
-            Err(()) => TryParkResult::Shutdown,
+    pub(super) fn try_park_for<E: TimedEvent>(
+        &self,
+        timeout: E::Duration,
+    ) -> Result<Option<E::Duration>, ()> {
+        let mut timeout = Some(timeout);
+        let unparked = self.park_with::<E>(|event| {
+            let duration = timeout.take().unwrap();
+            event.try_wait_for(duration)
+        });
+
+        if !unparked {
+            assert!(timeout.is_none());
+            return Err(());
         }
+
+        Ok(timeout.take())
     }
 
-    const UNPARKED: *mut EventRef = invalid_mut(0x1);
-    const SHUTDOWN: *mut EventRef = invalid_mut(0x2);
+    const UNPARKED: *mut EventRef = NonNull::dangling().as_ptr();
 
-    fn park_with<E: Event>(&self, do_park: impl FnOnce(Pin<&E>) -> bool) -> Result<bool, ()> {
+    fn park_with<E: Event>(&self, do_park: impl FnOnce(Pin<&E>) -> bool) -> bool {
         let mut unparked = true;
         let mut state = self.state.load(Ordering::Acquire);
 
@@ -75,7 +66,6 @@ impl Parker {
                 let pinned = unsafe { Pin::new_unchecked(&event_ref) };
                 let event_ref_ptr = NonNull::from(&*pinned).as_ptr();
                 assert_ne!(event_ref_ptr, Self::UNPARKED);
-                assert_ne!(event_ref_ptr, Self::SHUTDOWN);
 
                 if let Err(e) = self.state.compare_exchange(
                     null_mut(),
@@ -107,64 +97,26 @@ impl Parker {
             });
         }
 
-        if state.is_null() {
-            assert!(!unparked);
-            return Ok(false);
+        if unparked {
+            assert_eq!(state, Self::UNPARKED);
+            self.state.store(null_mut(), Ordering::Relaxed);
         }
 
-        if state == Self::UNPARKED {
-            state = self
-                .state
-                .compare_exchange(
-                    Self::UNPARKED,
-                    null_mut(),
-                    Ordering::Acquire,
-                    Ordering::Acquire,
-                )
-                .unwrap_or_else(|e| e);
-        }
-
-        match state {
-            Self::UNPARKED => Ok(true),
-            Self::SHUTDOWN => Err(()),
-            _ => unreachable!(),
-        }
+        unparked
     }
 
     pub(super) fn unpark(&self) {
         let mut state = self.state.load(Ordering::SeqCst);
 
-        while (state != Self::UNPARKED) && (state != Self::SHUTDOWN) {
-            match self.state.compare_exchange_weak(
-                state,
-                Self::UNPARKED,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Err(e) => state = e,
-                Ok(_) => {
-                    return unsafe {
-                        let event_ref = read(state);
-                        (event_ref.set_fn)(event_ref.ptr)
-                    }
-                }
+        if !state.is_null() && (state != Self::UNPARKED) {
+            state = self.state.swap(Self::UNPARKED, Ordering::AcqRel);
+        }
+
+        if !state.is_null() && (state != Self::UNPARKED) {
+            unsafe {
+                let event_ref = read(state);
+                (event_ref.set_fn)(event_ref.ptr);
             }
-        }
-    }
-
-    pub(super) fn is_shutdown(&self) -> bool {
-        self.state.load(Ordering::Acquire) == Self::SHUTDOWN
-    }
-
-    pub(super) fn shutdown(&self) {
-        let state = self.state.swap(Self::SHUTDOWN, Ordering::AcqRel);
-        if (state == Self::UNPARKED) || (state == Self::SHUTDOWN) {
-            return;
-        }
-
-        unsafe {
-            let event_ref = read(state);
-            (event_ref.set_fn)(event_ref.ptr)
         }
     }
 }
