@@ -6,6 +6,12 @@ use core::{
     sync::atomic::{AtomicPtr, Ordering},
 };
 
+pub(super) enum TryParkResult<E: TimedEvent> {
+    Interrupted(E::Duration),
+    Unparked,
+    Timeout,
+}
+
 struct EventRef {
     _pinned: PhantomPinned,
     ptr: NonNull<()>,
@@ -28,10 +34,7 @@ impl Parker {
         }))
     }
 
-    pub(super) fn try_park_for<E: TimedEvent>(
-        &self,
-        timeout: E::Duration,
-    ) -> Result<Option<E::Duration>, ()> {
+    pub(super) fn try_park_for<E: TimedEvent>(&self, timeout: E::Duration) -> TryParkResult<E> {
         let mut timeout = Some(timeout);
         let unparked = self.park_with::<E>(|event| {
             let duration = timeout.take().unwrap();
@@ -40,10 +43,13 @@ impl Parker {
 
         if !unparked {
             assert!(timeout.is_none());
-            return Err(());
+            return TryParkResult::Timeout;
         }
 
-        Ok(timeout.take())
+        match timeout {
+            Some(unused) => TryParkResult::Interrupted(unused),
+            None => TryParkResult::Unparked,
+        }
     }
 
     const UNPARKED: *mut EventRef = NonNull::dangling().as_ptr();

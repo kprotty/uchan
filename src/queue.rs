@@ -1,7 +1,7 @@
 use crate::{
     backoff::Backoff,
     event::{Event, TimedEvent},
-    parker::Parker,
+    parker::{Parker, TryParkResult},
 };
 use alloc::boxed::Box;
 use cache_padded::CachePadded;
@@ -226,11 +226,20 @@ impl<T> Queue<T> {
     }
 
     pub(super) unsafe fn recv<E: Event>(&self) -> Result<T, ()> {
-        self.recv_with(|| {
-            self.consumer.parker.park::<E>();
-            false
-        })
-        .map(|value| value.unwrap())
+        let mut spins: u32 = 16;
+        loop {
+            match self.try_recv() {
+                Ok(None) => {}
+                Err(()) => return Err(()),
+                Ok(Some(value)) => return Ok(value),
+            }
+
+            spins = spins.saturating_sub(1);
+            match spins {
+                0 => self.consumer.parker.park::<E>(),
+                _ => Backoff::spin_loop_hint(),
+            }
+        }
     }
 
     pub(super) unsafe fn recv_timeout<E: TimedEvent>(
@@ -238,32 +247,17 @@ impl<T> Queue<T> {
         timeout: E::Duration,
     ) -> Result<Option<T>, ()> {
         let mut timeout = Some(timeout);
-        self.recv_with(|| {
-            let duration = timeout.take().unwrap();
-
-            match self.consumer.parker.try_park_for::<E>(duration) {
-                Err(()) | Ok(None) => true,
-                Ok(Some(unused_duration)) => {
-                    timeout = Some(unused_duration);
-                    false
-                }
-            }
-        })
-    }
-
-    unsafe fn recv_with(&self, mut do_park: impl FnMut() -> bool) -> Result<Option<T>, ()> {
-        let mut spins: u32 = 16;
-        let mut timed_out = false;
         loop {
             match self.try_recv() {
-                Ok(None) if !timed_out => {}
+                Ok(None) if timeout.is_some() => {}
                 result => return result,
             }
 
-            spins = spins.saturating_sub(1);
-            match spins {
-                0 => timed_out = do_park(),
-                _ => Backoff::spin_loop_hint(),
+            let duration = timeout.take().unwrap();
+            match self.consumer.parker.try_park_for::<E>(duration) {
+                TryParkResult::Interrupted(unused) => timeout = Some(unused),
+                TryParkResult::Unparked => {}
+                TryParkResult::Timeout => {}
             }
         }
     }
@@ -283,6 +277,24 @@ impl<T> Queue<T> {
 
 impl<T> Drop for Queue<T> {
     fn drop(&mut self) {
-        unimplemented!("todo")
+        let head = self.consumer.head.load(Ordering::Acquire);
+        let (mut block, mut index, _) = Block::<T>::decode(head);
+
+        while !block.is_null() {
+            unsafe {
+                for i in index..BLOCK_SIZE {
+                    match (*block).stored[index].load(Ordering::Acquire) {
+                        true => drop((*block).values[index].get().read().assume_init()),
+                        _ => break,
+                    }
+                }
+
+                let next_block = (*block).next.load(Ordering::Acquire);
+                drop(Box::from_raw(block));
+
+                block = next_block;
+                index = 0;
+            }
+        }
     }
 }
