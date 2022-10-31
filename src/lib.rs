@@ -202,7 +202,7 @@ impl<T> RawSender<T> {
     /// drop(rx);
     /// assert_eq!(tx.send(1).unwrap_err().0, 1);
     /// ```
-    fn send(&self, value: T) -> Result<(), SendError<T>> {
+    pub fn send(&self, value: T) -> Result<(), SendError<T>> {
         self.queue.send(value).map_err(SendError)
     }
 }
@@ -427,7 +427,7 @@ impl<E, T> fmt::Debug for RawReceiver<E, T> {
     }
 }
 
-impl<E, T> RawReceiver<E, T> {
+impl<E, T> Drop for RawReceiver<E, T> {
     fn drop(&mut self) {
         let is_sender = false;
         self.queue.disconnect(is_sender);

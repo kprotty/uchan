@@ -283,8 +283,8 @@ impl<T> Drop for Queue<T> {
         while !block.is_null() {
             unsafe {
                 for i in index..BLOCK_SIZE {
-                    match (*block).stored[index].load(Ordering::Acquire) {
-                        true => drop((*block).values[index].get().read().assume_init()),
+                    match (*block).stored[i].load(Ordering::Acquire) {
+                        true => drop((*block).values[i].get().read().assume_init()),
                         _ => break,
                     }
                 }
