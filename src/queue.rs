@@ -13,13 +13,17 @@ use core::{
 };
 use sptr::{from_exposed_addr_mut, Strict};
 
+struct Slot<T> {
+    value: UnsafeCell<MaybeUninit<T>>,
+    ready: AtomicBool,
+}
+
 const BLOCK_ALIGN: usize = 4096;
 const BLOCK_SIZE: usize = 256;
 
 #[repr(align(4096))]
 struct Block<T> {
-    values: [UnsafeCell<MaybeUninit<T>>; BLOCK_SIZE],
-    stored: [AtomicBool; BLOCK_SIZE],
+    slots: [Slot<T>; BLOCK_SIZE],
     next: AtomicPtr<Self>,
     pending: AtomicIsize,
 }
@@ -28,11 +32,13 @@ const INDEX_SHIFT: u32 = 1;
 const DISCONNECT_BIT: usize = 0b1;
 
 impl<T> Block<T> {
-    const EMPTY_VALUE: UnsafeCell<MaybeUninit<T>> = UnsafeCell::new(MaybeUninit::uninit());
-    const EMPTY_STORED: AtomicBool = AtomicBool::new(false);
+    const EMPTY_SLOT: Slot<T> = Slot {
+        value: UnsafeCell::new(MaybeUninit::uninit()),
+        ready: AtomicBool::new(false),
+    };
+
     const EMPTY: Self = Self {
-        values: [Self::EMPTY_VALUE; BLOCK_SIZE],
-        stored: [Self::EMPTY_STORED; BLOCK_SIZE],
+        slots: [Self::EMPTY_SLOT; BLOCK_SIZE],
         next: AtomicPtr::new(null_mut()),
         pending: AtomicIsize::new(0),
     };
@@ -171,8 +177,10 @@ impl<T> Queue<T> {
             let result = match result {
                 Err(()) => Err(value),
                 Ok((block, index, pending)) => Ok({
-                    (*block).values[index].get().write(MaybeUninit::new(value));
-                    (*block).stored[index].store(true, Ordering::SeqCst);
+                    let slot = NonNull::from(&(*block).slots[index]);
+                    slot.as_ref().value.get().write(MaybeUninit::new(value));
+
+                    slot.as_ref().ready.store(true, Ordering::SeqCst);
                     self.consumer.parker.unpark();
 
                     if let Some((pending_block, count)) = pending {
@@ -208,11 +216,13 @@ impl<T> Queue<T> {
             }
 
             if index < BLOCK_SIZE {
-                if (*block).stored[index].load(Ordering::Acquire) {
+                let slot = NonNull::from(&(*block).slots[index]);
+
+                if slot.as_ref().ready.load(Ordering::Acquire) {
                     let new_head = Block::encode(block, index + 1, false);
                     self.consumer.head.store(new_head, Ordering::Relaxed);
 
-                    let value = (*block).values[index].get().read().assume_init();
+                    let value = slot.as_ref().value.get().read().assume_init();
                     return Ok(Some(value));
                 }
             }
@@ -282,9 +292,9 @@ impl<T> Drop for Queue<T> {
 
         while !block.is_null() {
             unsafe {
-                for i in index..BLOCK_SIZE {
-                    match (*block).stored[i].load(Ordering::Acquire) {
-                        true => drop((*block).values[i].get().read().assume_init()),
+                for slot in &(*block).slots[index..] {
+                    match slot.ready.load(Ordering::Acquire) {
+                        true => drop(slot.value.get().read().assume_init()),
                         _ => break,
                     }
                 }
