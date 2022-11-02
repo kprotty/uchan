@@ -2,21 +2,16 @@ use crate::{
     backoff::Backoff,
     event::{Event, TimedEvent},
     parker::{Parker, TryParkResult},
+    queue::{fetch_add_ptr, Slot},
 };
 use alloc::boxed::Box;
 use cache_padded::CachePadded;
 use core::{
-    cell::UnsafeCell,
-    mem::{drop, MaybeUninit},
+    mem::drop,
     ptr::{null_mut, NonNull},
-    sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, Ordering},
 };
-use sptr::{from_exposed_addr_mut, Strict};
-
-struct Slot<T> {
-    value: UnsafeCell<MaybeUninit<T>>,
-    ready: AtomicBool,
-}
+use sptr::Strict;
 
 const BLOCK_ALIGN: usize = 4096;
 const BLOCK_SIZE: usize = 256;
@@ -32,23 +27,11 @@ const INDEX_SHIFT: u32 = 1;
 const DISCONNECT_BIT: usize = 0b1;
 
 impl<T> Block<T> {
-    const EMPTY_SLOT: Slot<T> = Slot {
-        value: UnsafeCell::new(MaybeUninit::uninit()),
-        ready: AtomicBool::new(false),
-    };
-
     const EMPTY: Self = Self {
-        slots: [Self::EMPTY_SLOT; BLOCK_SIZE],
+        slots: [Slot::<T>::EMPTY; BLOCK_SIZE],
         next: AtomicPtr::new(null_mut()),
         pending: AtomicIsize::new(0),
     };
-
-    #[inline(always)]
-    fn fetch_add(block_ptr: &AtomicPtr<Self>, ptr: usize, ordering: Ordering) -> *mut Self {
-        let usize_ptr = (block_ptr as *const AtomicPtr<Self>).cast::<AtomicUsize>();
-        let result = unsafe { (*usize_ptr).fetch_add(ptr, ordering) };
-        from_exposed_addr_mut(result)
-    }
 
     fn encode(block: *mut Self, index: usize, disconnected: bool) -> *mut Self {
         block.map_addr(|addr| {
@@ -81,13 +64,13 @@ struct Consumer<T> {
     disconnected: AtomicBool,
 }
 
-pub(super) struct Queue<T> {
+pub(crate) struct Queue<T> {
     producer: CachePadded<AtomicPtr<Block<T>>>,
     consumer: CachePadded<Consumer<T>>,
 }
 
 impl<T> Queue<T> {
-    pub(super) const EMPTY: Self = Self {
+    pub(crate) const EMPTY: Self = Self {
         producer: CachePadded::new(AtomicPtr::new(null_mut())),
         consumer: CachePadded::new(Consumer {
             head: AtomicPtr::new(null_mut()),
@@ -96,13 +79,13 @@ impl<T> Queue<T> {
         }),
     };
 
-    pub(super) fn send(&self, value: T) -> Result<(), T> {
+    pub(crate) fn send(&self, value: T) -> Result<(), T> {
         unsafe {
             let mut new_block: *mut Block<T> = null_mut();
 
             let result = (|| loop {
                 let one_index = 1 << INDEX_SHIFT;
-                let tail = Block::<T>::fetch_add(&*self.producer, one_index, Ordering::Acquire);
+                let tail = fetch_add_ptr(&*self.producer, one_index, Ordering::Acquire);
 
                 let (block, index, disconnected) = Block::<T>::decode(tail);
                 if disconnected {
@@ -177,10 +160,7 @@ impl<T> Queue<T> {
             let result = match result {
                 Err(()) => Err(value),
                 Ok((block, index, pending)) => Ok({
-                    let slot = NonNull::from(&(*block).slots[index]);
-                    slot.as_ref().value.get().write(MaybeUninit::new(value));
-
-                    slot.as_ref().ready.store(true, Ordering::SeqCst);
+                    (*block).slots[index].write(value, Ordering::SeqCst);
                     self.consumer.parker.unpark();
 
                     if let Some((pending_block, count)) = pending {
@@ -197,9 +177,10 @@ impl<T> Queue<T> {
         }
     }
 
-    pub(super) unsafe fn try_recv(&self) -> Result<Option<T>, ()> {
+    pub(crate) unsafe fn try_recv(&self) -> Result<Option<T>, ()> {
         let head = self.consumer.head.load(Ordering::Acquire);
         let (mut block, mut index, _) = Block::<T>::decode(head);
+        assert!(index <= BLOCK_SIZE);
 
         if !block.is_null() {
             if index == BLOCK_SIZE {
@@ -216,13 +197,9 @@ impl<T> Queue<T> {
             }
 
             if index < BLOCK_SIZE {
-                let slot = NonNull::from(&(*block).slots[index]);
-
-                if slot.as_ref().ready.load(Ordering::Acquire) {
+                if let Some(value) = (*block).slots[index].read(Ordering::Acquire) {
                     let new_head = Block::encode(block, index + 1, false);
                     self.consumer.head.store(new_head, Ordering::Relaxed);
-
-                    let value = slot.as_ref().value.get().read().assume_init();
                     return Ok(Some(value));
                 }
             }
@@ -235,7 +212,7 @@ impl<T> Queue<T> {
         }
     }
 
-    pub(super) unsafe fn recv<E: Event>(&self) -> Result<T, ()> {
+    pub(crate) unsafe fn recv<E: Event>(&self) -> Result<T, ()> {
         let mut spins: u32 = 16;
         loop {
             match self.try_recv() {
@@ -252,7 +229,7 @@ impl<T> Queue<T> {
         }
     }
 
-    pub(super) unsafe fn recv_timeout<E: TimedEvent>(
+    pub(crate) unsafe fn recv_timeout<E: TimedEvent>(
         &self,
         timeout: E::Duration,
     ) -> Result<Option<T>, ()> {
@@ -272,14 +249,14 @@ impl<T> Queue<T> {
         }
     }
 
-    pub(super) fn disconnect(&self, is_sender: bool) {
+    pub(crate) fn disconnect(&self, is_sender: bool) {
         if is_sender {
             self.consumer.disconnected.store(true, Ordering::Release);
             self.consumer.parker.unpark();
             return;
         }
 
-        let tail = Block::<T>::fetch_add(&*self.producer, DISCONNECT_BIT, Ordering::Release);
+        let tail = fetch_add_ptr(&*self.producer, DISCONNECT_BIT, Ordering::Release);
         let (_, _, disconnected) = Block::<T>::decode(tail);
         assert!(!disconnected);
     }
@@ -293,9 +270,9 @@ impl<T> Drop for Queue<T> {
         while !block.is_null() {
             unsafe {
                 for slot in &(*block).slots[index..] {
-                    match slot.ready.load(Ordering::Acquire) {
-                        true => drop(slot.value.get().read().assume_init()),
-                        _ => break,
+                    match slot.read(Ordering::Acquire) {
+                        Some(value) => drop(value),
+                        None => break,
                     }
                 }
 
