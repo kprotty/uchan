@@ -1,0 +1,9 @@
+[package]
+name = "mpsc-benchmark"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+uchan = { path = "../", features = ["std"] }
+crossbeam-channel = "0.5.6"
+flume = "0.10.14"

@@ -23,8 +23,7 @@ mod if_std {
         cell::Cell,
         marker::PhantomPinned,
         pin::Pin,
-        ptr::{null_mut, NonNull},
-        sync::atomic::{AtomicBool, AtomicPtr, Ordering},
+        sync::atomic::{AtomicBool, Ordering},
         thread,
     };
 
@@ -61,7 +60,7 @@ mod if_std {
         }
     }
 
-    impl TimedEvent for StdEvent {
+    impl super::TimedEvent for StdEvent {
         type Duration = std::time::Duration;
 
         fn try_wait_for(self: Pin<&Self>, timeout: Self::Duration) -> bool {
