@@ -7,3 +7,4 @@ edition = "2021"
 uchan = { path = "../", features = ["std"] }
 crossbeam-channel = "0.5.6"
 flume = "0.10.14"
+core_affinity = "0.5.10"

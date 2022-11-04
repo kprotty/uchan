@@ -13,9 +13,44 @@ pub fn main() {
     let num_cpus = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
 
     bench_concurrent("spsc", 2);
-    bench_concurrent("micro_contention", 3);
+
+    if num_cpus > 3 {
+        bench_concurrent("micro_contention", 3);
+    }
+
+    if num_cpus > 5 {
+        bench_concurrent("traditional contention", 5);
+    }
+
     bench_concurrent("high_contention", num_cpus);
+
     bench_concurrent("over_subscribed", num_cpus * 2);
+
+    {
+        let core_ids = core_affinity::get_core_ids().unwrap();
+        let context  = Arc::new((core_ids, AtomicBool::new(false)));
+
+        let busy_threads = (0..num_cpus)
+            .map(|i| {
+                let context = context.clone();
+                thread::spawn(move || {
+                    let core_id = context.0[i % context.0.len()];
+                    core_affinity::set_for_current(core_id);
+                    
+                    while !context.1.load(Ordering::Relaxed) {
+                        std::hint::spin_loop();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        bench_concurrent("busy_system", num_cpus);
+
+        context.1.store(true, Ordering::Relaxed);
+        for thread in busy_threads.into_iter() {
+            thread.join().unwrap();
+        }
+    }
 }
 
 fn bench_concurrent(bench_name: &str, num_cpus: usize) {
