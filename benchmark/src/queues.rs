@@ -10,10 +10,10 @@ pub trait Channel: 'static {
 }
 
 pub trait ChannelSender: Clone + Send + 'static {
-    fn send(&self, value: usize);
+    fn send(&self, value: usize) -> bool;
 }
 
-pub trait ChannelReceiver: 'static {
+pub trait ChannelReceiver: Send + 'static {
     fn recv(&self) -> usize;
 }
 
@@ -41,8 +41,8 @@ macro_rules! impl_channel {
             pub struct ChannelSenderImpl($pkg::Sender<usize>);
 
             impl ChannelSender for ChannelSenderImpl {
-                fn send(&self, value: usize) {
-                    self.0.send(value).unwrap()
+                fn send(&self, value: usize) -> bool {
+                    self.0.send(value).is_ok()
                 }
             }
 
