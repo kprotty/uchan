@@ -2,6 +2,11 @@
 name = "uchan"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/kprotty/uchan"
+keywords = ["channel", "mpsc", "fifo", "channel", "thread"]
+categories = ["algorithms", "concurrency", "data-structures", "no_std"]
 
 [features]
 default = ["std"]
