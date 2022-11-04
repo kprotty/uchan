@@ -213,7 +213,7 @@ impl<T> Queue<T> {
     }
 
     pub(crate) unsafe fn recv<E: Event>(&self) -> Result<T, ()> {
-        let mut spins: u32 = 16;
+        let mut spins: u32 = 32;
         loop {
             match self.try_recv() {
                 Ok(None) => {}
