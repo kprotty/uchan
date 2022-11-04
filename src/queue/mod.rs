@@ -1,5 +1,8 @@
 #[cfg_attr(any(target_arch = "x86", target_arch = "x86_64"), path = "./faa.rs")]
-#[cfg_attr(not(any(target_arch = "x86", target_arch = "x86_64")), path = "./cas.rs")]
+#[cfg_attr(
+    not(any(target_arch = "x86", target_arch = "x86_64")),
+    path = "./cas.rs"
+)]
 mod queue;
 pub(super) use queue::Queue;
 

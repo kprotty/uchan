@@ -1,10 +1,96 @@
+//! Multi-producer, single-consumer FIFO queue communication primitives.
+//!
+//! This module provides message-based communication over channels, concretely
+//! defined among two types:
+//!
+//! * [`Sender`]
+//! * [`Receiver`]
+//!
+//! A [`Sender`] is used to send data to a [`Receiver`]. Senders are clone-able (multi-producer)
+//! such that many threads can send simultaneously to one receiver (single-consumer).
+//!
+//! There is currently one flavour available: An asynchronous, infinitely buffered channel.
+//! The [`channel`] function will return a `(Sender, Receiver)` tuple where all sends will be
+//! **asynchronous** (they never block). The channel conceptually has an infinite buffer.
+//!
+//! ## `no_std` Usage
+//!
+//! Channels can be used in `no_std` settings due to the thread blocking facilities being made generic.
+//! Use the `Event` trait to implement thread parking and create custom [`RawSender`]s and [`Receiver`]s using `raw_channel`.
+//! The default [`Sender`] and [`Receiver`] use `StdEvent` which implements thread parking using `std::thread::park`.
+//!
+//! ## Disconnection
+//!
+//! The send and receive operations on channels will all return a [`Result`]
+//! indicating whether the operation succeeded or not. An unsuccessful operation
+//! is normally indicative of the other half of a channel having "hung up" by
+//! being dropped in its corresponding thread.
+//!
+//! Once half of a channel has been deallocated, most operations can no longer
+//! continue to make progress, so [`Err`] will be returned. Many applications
+//! will continue to [`unwrap`] the results returned from this module,
+//! instigating a propagation of failure among threads if one unexpectedly dies.
+//!
+//! [`unwrap`]: Result::unwrap
+//!
+//! # Examples
+//!
+//! Simple usage:
+//!
+//! ```
+//! use std::thread;
+//! use uchan::channel;
+//!
+//! // Create a simple streaming channel
+//! let (tx, rx) = channel();
+//! thread::spawn(move|| {
+//!     tx.send(10).unwrap();
+//! });
+//! assert_eq!(rx.recv().unwrap(), 10);
+//! ```
+//!
+//! Shared usage:
+//!
+//! ```
+//! use std::thread;
+//! use uchan::channel;
+//!
+//! // Create a shared channel that can be sent along from many threads
+//! // where tx is the sending half (tx for transmission), and rx is the receiving
+//! // half (rx for receiving).
+//! let (tx, rx) = channel();
+//! for i in 0..10 {
+//!     let tx = tx.clone();
+//!     thread::spawn(move|| {
+//!         tx.send(i).unwrap();
+//!     });
+//! }
+//!
+//! for _ in 0..10 {
+//!     let j = rx.recv().unwrap();
+//!     assert!(0 <= j && j < 10);
+//! }
+//! ```
+//!
+//! Propagating panics:
+//!
+//! ```
+//! use uchan::channel;
+//!
+//! // The call to recv() will return an error because the channel has already
+//! // hung up (or been deallocated)
+//! let (tx, rx) = channel::<i32>();
+//! drop(tx);
+//! assert!(rx.recv().is_err());
+//! ```
+
 #![cfg_attr(not(feature = "std"), no_std)]
 #![allow(unstable_name_collisions)]
 #![warn(
     rust_2018_idioms,
     unreachable_pub,
-    // missing_docs,
-    // missing_debug_implementations
+    missing_docs,
+    missing_debug_implementations
 )]
 
 extern crate alloc;
@@ -27,9 +113,22 @@ pub use if_std::*;
 mod if_std {
     pub use super::event::StdEvent;
 
+    /// An unbounded channel sender implemented with [`StdEvent`].
+    /// See [`RawSender`] for more details.
+    ///
+    /// [`RawSender`]: super::RawSender
     pub type Sender<T> = super::RawSender<T>;
+
+    /// An unbounded channel receiver implemented with [`StdEvent`].
+    /// See [`RawReceiver`] for more details.
+    ///
+    /// [`RawReceiver`]: super::RawReceiver
     pub type Receiver<T> = super::RawReceiver<StdEvent, T>;
 
+    /// Creates an unbounded channel [`Sender`] and [`Receiver`] using the `StdEvent` implementation.
+    /// See [`raw_channel`] for more details.
+    ///
+    /// [`raw_channel`]: super::raw_channel
     pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
         super::raw_channel::<StdEvent, T>()
     }
@@ -136,7 +235,7 @@ pub fn raw_channel<E, T>() -> (RawSender<T>, RawReceiver<E, T>) {
     (sender, receiver)
 }
 
-/// The sending-half of Rust's asynchronous [`Rawchannel`] type. This half can only be
+/// The sending-half of Rust's asynchronous [`raw_channel`] type. This half can only be
 /// owned by one thread, but it can be cloned to send to other threads.
 ///
 /// Messages can be sent through this channel with [`send`].
@@ -379,7 +478,7 @@ impl<E: TimedEvent, T> RawReceiver<E, T> {
     /// ```no_run
     /// use std::thread;
     /// use std::time::Duration;
-    /// use uchan::channl;
+    /// use uchan::channel;
     ///
     /// let (send, recv) = channel();
     ///
