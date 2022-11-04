@@ -15,13 +15,14 @@ pub fn main() {
     bench_concurrent("spsc", 2);
     bench_concurrent("micro_contention", 3);
     bench_concurrent("high_contention", num_cpus);
+    bench_concurrent("over_subscribed", num_cpus * 2);
 }
 
 fn bench_concurrent(bench_name: &str, num_cpus: usize) {
     println!("{:?} (producers:{}, consumers:1) \n{}\n{:?}",
         bench_name,
         num_cpus - 1,
-        "-".repeat(90),
+        "-".repeat(82),
         ConcurrentResult::default(),
     );
 
@@ -49,24 +50,24 @@ fn bench_concurrent_queue<C: Channel>(num_cpus: usize) {
     });
 
     let send_threads: Vec<_> = (0..(num_cpus - 1))
-        .map(|_| {
+        .map(|mut i| {
             let tx = tx.clone();
             let context = context.clone();
 
             thread::spawn(move || {
                 let mut send_times = Vec::with_capacity(1024);
                 context.0.wait();
-                
-                let mut started = Instant::now();
-                while tx.send(0x42) {
-                    let completed = Instant::now();
-                    let elapsed: u64 = completed.duration_since(started).as_nanos().try_into().unwrap();
 
+                loop {
+                    let started = Instant::now();
+                    if !tx.send(i) {
+                        return send_times;
+                    }
+
+                    let elapsed: u64 = started.elapsed().as_nanos().try_into().unwrap();
                     send_times.push(elapsed);
-                    started = completed;
+                    i += 1;
                 }
-
-                send_times
             })
         })
         .collect();
@@ -143,7 +144,7 @@ impl fmt::Debug for ConcurrentResult {
             format!("{:.2}b", value / 1_000_000_000f64)
         };
 
-        write!(f, "{:<18} |", self.name.unwrap_or("queue"))?;
+        write!(f, "{:<10} |", self.name.unwrap_or("name"))?;
         write!(f, " {:>7} |", self.recv_total.map(humanize).unwrap_or("recv".to_string()))?;
         write!(f, " {:>7} |", self.send_total.map(humanize).unwrap_or("sent".to_string()))?;
         write!(f, " {:>7} |", self.send_stdev.map(humanize).unwrap_or("stdev".to_string()))?;
