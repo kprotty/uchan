@@ -14,7 +14,7 @@ use core::{
 use sptr::Strict;
 
 const BLOCK_ALIGN: usize = 256;
-const BLOCK_SIZE: usize = 128;
+const BLOCK_SIZE: usize = 64;
 
 #[repr(align(256))]
 struct Block<T> {
