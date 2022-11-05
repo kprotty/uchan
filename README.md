@@ -9,7 +9,7 @@ https://docs.rs/uchan)
 https://github.com/kprotty/uchan)
 
 This is (almost) a drop-in replacement for `std::sync::mpsc` with a focus on being lock-free and scalable for both producers and consumers.
-It also supports being used as `#![no_std]`, in which the caller provides a trait used to block and unblock a thread, with the queue implementing everything else from there. Finally, `benchmark/` contains (you guessed it) robust benchmarks against other channel implementations/
+It also supports being used as `#![no_std]`, in which the caller provides a trait used to block and unblock a thread, with the queue implementing everything else from there.
 
 ## Usage
 
@@ -17,6 +17,15 @@ It also supports being used as `#![no_std]`, in which the caller provides a trai
 [dependencies]
 uchan = "0.1.0"
 ```
+
+## Benchmarking
+
+```bash
+cd benchmark
+cargo run --release
+```
+
+For adding custom channels to the benchmark, see `benchmark/src/queues.rs`.
 
 ## License
 
