@@ -142,9 +142,18 @@ mod if_std {
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub struct SendError<T>(pub T);
 
+#[cfg(feature = "std")]
+impl<T: Send> std::error::Error for SendError<T> {}
+
 impl<T> fmt::Debug for SendError<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SendError").finish_non_exhaustive()
+    }
+}
+
+impl<T> fmt::Display for SendError<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        "sending on a closed channel".fmt(f)
     }
 }
 
@@ -157,6 +166,15 @@ impl<T> fmt::Debug for SendError<T> {
 /// [`recv`]: RawReceiver::recv
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub struct RecvError;
+
+#[cfg(feature = "std")]
+impl std::error::Error for RecvError {}
+
+impl fmt::Display for RecvError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        "receiving on a closed channel".fmt(f)
+    }
+}
 
 /// This enumeration is the list of the possible reasons that [`try_recv`] could
 /// not return data when called. This can occur with a [`raw_channel`].
@@ -173,6 +191,31 @@ pub enum TryRecvError {
     Disconnected,
 }
 
+#[cfg(feature = "std")]
+impl std::error::Error for TryRecvError {}
+
+impl fmt::Display for TryRecvError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            TryRecvError::Empty => "receiving on an empty channel".fmt(f),
+            TryRecvError::Disconnected => "receiving on a closed channel".fmt(f),
+        }
+    }
+}
+
+impl From<RecvError> for TryRecvError {
+    /// Converts a `RecvError` into a `TryRecvError`.
+    ///
+    /// This conversion always returns `TryRecvError::Disconnected`.
+    ///
+    /// No data is allocated on the heap.
+    fn from(err: RecvError) -> TryRecvError {
+        match err {
+            RecvError => TryRecvError::Disconnected,
+        }
+    }
+}
+
 /// This enumeration is the list of possible errors that made [`recv_timeout`]
 /// unable to return data when called. This can occur with a [`raw_channel`].
 ///
@@ -185,6 +228,31 @@ pub enum RecvTimeoutError {
     /// The **channel**'s sending half has become disconnected, and there will
     /// never be any more data received on it.
     Disconnected,
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for RecvTimeoutError {}
+
+impl fmt::Display for RecvTimeoutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            RecvTimeoutError::Timeout => "timed out waiting on channel".fmt(f),
+            RecvTimeoutError::Disconnected => "channel is empty and sending half is closed".fmt(f),
+        }
+    }
+}
+
+impl From<RecvError> for RecvTimeoutError {
+    /// Converts a `RecvError` into a `RecvTimeoutError`.
+    ///
+    /// This conversion always returns `RecvTimeoutError::Disconnected`.
+    ///
+    /// No data is allocated on the heap.
+    fn from(err: RecvError) -> RecvTimeoutError {
+        match err {
+            RecvError => RecvTimeoutError::Disconnected,
+        }
+    }
 }
 
 /// Creates a new asynchronous channel, returning the sender/receiver halves.
