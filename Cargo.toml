@@ -1,12 +1,12 @@
 [package]
 name = "uchan"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/kprotty/uchan"
 keywords = ["mpsc", "fifo", "channel", "thread"]
-categories = ["algorithms", "concurrency", "data-structures", "no_std"]
+categories = ["algorithms", "concurrency", "data-structures", "no-std"]
 description = "Multi-producer single-consumer channel for message passing"
 
 [features]

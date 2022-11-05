@@ -15,7 +15,7 @@ It also supports being used as `#![no_std]`, in which the caller provides a trai
 
 ```toml
 [dependencies]
-uchan = "0.1.2"
+uchan = "0.1.3"
 ```
 
 ## Benchmarking
