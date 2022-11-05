@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 pub(super) struct Backoff;
 
 // On Apple ARM devices, a single WFE deschedules the CPU better than (multiple) YIELD.
@@ -26,7 +28,7 @@ impl Backoff {
         static RNG_SEED: AtomicUsize = AtomicUsize::new(1);
 
         let seed = RNG_SEED.load(Ordering::Relaxed);
-        RNG_SEED.store(seed.wrapping_mul(1103515245) + 12345, Ordering::Relaxed);
+        RNG_SEED.store(seed.wrapping_mul(1103515245).wrapping_add(12345), Ordering::Relaxed);
 
         const MAX_SPINS: usize = 128 - 1;
         const MIN_SPINS: usize = 32 - 1;

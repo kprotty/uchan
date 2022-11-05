@@ -119,10 +119,9 @@ impl<T> Queue<T> {
                         Err(e) => next_block = e,
                     }
                 }
-
+                
+                let mut tail = self.producer.load(Ordering::Relaxed);
                 loop {
-                    let tail = self.producer.load(Ordering::Acquire);
-
                     let (current_block, current_index, disconnected) = Block::<T>::decode(tail);
                     if disconnected {
                         return Err(());
@@ -137,13 +136,13 @@ impl<T> Queue<T> {
                         break;
                     }
 
-                    if let Err(_) = self.producer.compare_exchange_weak(
+                    if let Err(e) = self.producer.compare_exchange_weak(
                         tail,
                         Block::encode(next_block, 1, false),
                         Ordering::Release,
                         Ordering::Relaxed,
                     ) {
-                        Backoff::yield_now();
+                        tail = e;
                         continue;
                     }
 
